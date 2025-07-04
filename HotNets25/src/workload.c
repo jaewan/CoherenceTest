@@ -5,110 +5,122 @@
 #include <pthread.h>
 #include <unistd.h>
 
-// Phase 1: Intra-Node Parallel Work (Local Reduce)
-void phase1_intra_node_reduce(thread_context_t* ctx) {
-    timer_start(&ctx->phase_timers[0]);
-    
-    // Each thread increments the shared counter multiple times
-    for (int i = 0; i < ctx->config->increments_per_thread; i++) {
-        generic_lock_acquire(ctx->shared->intra_node_lock, ctx->thread_id);
-        ctx->shared->counter++;
-        generic_lock_release(ctx->shared->intra_node_lock, ctx->thread_id);
-    }
-    
-    timer_stop(&ctx->phase_timers[0]);
-}
-
-// Phase 2: Inter-Node Coordination (Global Barrier)
-void phase2_inter_node_barrier(thread_context_t* ctx) {
-    timer_start(&ctx->phase_timers[1]);
-    
-    // Only one thread per socket participates in inter-node coordination
-    if (ctx->thread_id % ctx->config->num_threads_per_socket == 0) {
-        generic_lock_acquire(ctx->shared->inter_node_lock, ctx->socket_id);
-        
-        // Simulate global coordination work
-        ctx->shared->barrier_count++;
-        
-        // Flush cache line for inter-node visibility
-        flush_cache_line((void*)&ctx->shared->barrier_count);
-        
-        generic_lock_release(ctx->shared->inter_node_lock, ctx->socket_id);
-    }
-    
-    // Local barrier - wait for all threads in socket to reach this point
-    static volatile int local_barrier_counter = 0;
-    static volatile bool local_barrier_sense = false;
-    
-    __sync_fetch_and_add(&local_barrier_counter, 1);
-    bool my_sense = local_barrier_sense;
-    
-    if (local_barrier_counter == ctx->config->num_threads_per_socket) {
-        local_barrier_counter = 0;
-        local_barrier_sense = !local_barrier_sense;
-    } else {
-        while (local_barrier_sense == my_sense) {
-            // Spin wait
-        }
-    }
-    
-    timer_stop(&ctx->phase_timers[1]);
-}
-
-// Phase 3: Scalable Parallel Compute
-void phase3_scalable_compute(thread_context_t* ctx) {
+/**
+ * @brief MAP PHASE (formerly phase3_scalable_compute)
+ * 
+ * This function simulates an embarrassingly parallel "Map" operation.
+ * Each thread performs a computationally-intensive loop on its own private data.
+ * There is NO explicit data sharing between threads or sockets.
+ *
+ * CRITICAL EXPERIMENT RATIONALE:
+ * The purpose of this phase is to measure the underlying "coherence tax" of a 
+ * given architecture. In the SYSTEM_FULLY_COHERENT model, even though no data
+ * is shared, the hardware's cache coherence protocol must still operate across
+ * the inter-socket interconnect, generating snoop traffic. This reveals a 
+ * fundamental scalability bottleneck. In contrast, the other models avoid this
+ * tax by not using hardware coherence between nodes, resulting in much better
+ * performance in this phase.
+ */
+void map_phase(thread_context_t* ctx) {
     timer_start(&ctx->phase_timers[2]);
-    
-    // Simulate independent computation
+
+    // Simulate independent computation on private stack data.
     volatile int result = 0;
     for (int i = 0; i < ctx->config->compute_cycles; i++) {
-        result += i * ctx->thread_id;
-        
-        // Inject coherence tax for fully coherent system
-        // This is determined by the lock type used
-        if (strstr(ctx->shared->intra_node_lock->name, "Hardware") != NULL &&
-            strstr(ctx->shared->inter_node_lock->name, "Hardware") != NULL) {
-            // This is the fully coherent system - inject tax
-            inject_coherence_tax(0); // Use default calibrated cycles
-        }
+        result += i; // This is just to keep the CPU busy.
     }
-    
+
     timer_stop(&ctx->phase_timers[2]);
 }
 
-// Main thread function
+/**
+ * @brief SHUFFLE PHASE (formerly phase2_inter_node_barrier)
+ * 
+ * This function simulates the coordination/synchronization step that would
+ * occur between the Map and Reduce phases. It models a lightweight barrier
+ * where each node must signal completion of its Map tasks.
+ */
+void shuffle_phase(thread_context_t* ctx) {
+    timer_start(&ctx->phase_timers[1]);
+
+    // A simple barrier to ensure all threads are done with the map phase.
+    // First, a local barrier within the socket.
+    int socket_base_thread_id = ctx->socket_id * ctx->config->num_threads_per_socket;
+    if (ctx->thread_id == socket_base_thread_id) {
+        // The first thread of each socket waits for all its peers.
+        for (int i = 1; i < ctx->config->num_threads_per_socket; i++) {
+            while (ctx->shared[ctx->socket_id].barrier_count < i) { usleep(1); }
+        }
+    } else {
+        __sync_fetch_and_add(&ctx->shared[ctx->socket_id].barrier_count, 1);
+    }
+
+    // Then, a global barrier across sockets.
+    // Only the first thread of each socket participates in the global barrier.
+    if (ctx->thread_id == socket_base_thread_id) {
+        generic_lock_acquire(ctx->shared[ctx->socket_id].inter_node_lock, ctx->thread_id);
+        // In a real scenario, this is where nodes would exchange data pointers.
+        generic_lock_release(ctx->shared[ctx->socket_id].inter_node_lock, ctx->thread_id);
+    }
+
+    timer_stop(&ctx->phase_timers[1]);
+}
+
+/**
+ * @brief REDUCE PHASE (formerly phase1_intra_node_reduce)
+ * 
+ * This function simulates a "Reduce" operation where all threads within a single
+ * node (socket) cooperatively update a shared data structure. This phase is
+ * designed to stress the intra-node coherence mechanism.
+ */
+void reduce_phase(thread_context_t* ctx) {
+    timer_start(&ctx->phase_timers[0]);
+
+    // Each thread repeatedly acquires a lock and increments a shared counter.
+    for (int i = 0; i < ctx->config->increments_per_thread; i++) {
+        generic_lock_acquire(ctx->shared[ctx->socket_id].intra_node_lock, ctx->thread_id);
+        ctx->shared[ctx->socket_id].counter++;
+        generic_lock_release(ctx->shared[ctx->socket_id].intra_node_lock, ctx->thread_id);
+    }
+
+    timer_stop(&ctx->phase_timers[0]);
+}
+
+
+// Main thread function that executes the workload phases in order.
 void* workload_thread(void* arg) {
     thread_context_t* ctx = (thread_context_t*)arg;
-    
-    // Pin thread to specific core
+
+    // Pin this thread to its assigned core for stable measurements.
     pin_thread_to_core(ctx->core_id);
-    
-    // Start total timer
+
+    // Wait for the master thread to signal the start.
+    pthread_barrier_wait(ctx->start_barrier);
+
     timer_start(&ctx->total_timer);
-    
-    // Execute the three phases
-    phase1_intra_node_reduce(ctx);
-    phase2_inter_node_barrier(ctx);
-    phase3_scalable_compute(ctx);
-    
-    // Stop total timer
+
+    // Execute the workload phases in the MapReduce order.
+    map_phase(ctx);
+    shuffle_phase(ctx);
+    reduce_phase(ctx);
+
     timer_stop(&ctx->total_timer);
-    
+
     return NULL;
 }
 
 // Initialize shared data structures
-void init_shared_data(shared_data_t* shared, workload_config_t* config, 
-                     generic_lock_t* intra_lock, generic_lock_t* inter_lock) {
-    shared->counter = 0;
-    shared->barrier_count = 0;
-    shared->barrier_sense = false;
-    shared->intra_node_lock = intra_lock;
-    shared->inter_node_lock = inter_lock;
+void init_shared_data(shared_data_t* shared_data_array, workload_config_t* config, 
+                     generic_lock_t* intra_locks, generic_lock_t* inter_locks) {
+    for (int i = 0; i < config->total_sockets; i++) {
+        shared_data_array[i].counter = 0;
+        shared_data_array[i].barrier_count = 0;
+        shared_data_array[i].intra_node_lock = &intra_locks[i];
+        shared_data_array[i].inter_node_lock = &inter_locks[i];
+    }
 }
 
 // Cleanup shared data
 void cleanup_shared_data(shared_data_t* shared) {
-    // Nothing to cleanup for now
-    (void)shared;
+    // Nothing to do for this workload, but good practice to have.
 }

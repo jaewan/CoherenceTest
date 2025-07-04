@@ -18,9 +18,9 @@ typedef struct {
 
 // Generic lock interface for system switching
 typedef struct {
-    void* lock_data;
-    void (*acquire)(void* lock, int thread_id);
-    void (*release)(void* lock, int thread_id);
+    volatile void* lock_data;
+    void (*acquire)(volatile void* lock, int thread_id);
+    void (*release)(volatile void* lock, int thread_id);
     const char* name;
 } generic_lock_t;
 

@@ -3,6 +3,8 @@
 
 #include "sync.h"
 #include "timer.h"
+#include "emulation.h" // For system_type_t
+#include <pthread.h>
 
 // Workload configuration
 typedef struct {
@@ -10,6 +12,7 @@ typedef struct {
     int increments_per_thread;
     int compute_cycles;
     int total_sockets;
+    system_type_t system_type;
 } workload_config_t;
 
 // Shared data structures
@@ -30,12 +33,13 @@ typedef struct {
     shared_data_t* shared;
     timer phase_timers[3];
     timer total_timer;
+    pthread_barrier_t* start_barrier; // Barrier to synchronize thread start
 } thread_context_t;
 
-// Phase functions
-void phase1_intra_node_reduce(thread_context_t* ctx);
-void phase2_inter_node_barrier(thread_context_t* ctx);
-void phase3_scalable_compute(thread_context_t* ctx);
+// Phase functions, now ordered to match the MapReduce narrative
+void map_phase(thread_context_t* ctx);
+void shuffle_phase(thread_context_t* ctx);
+void reduce_phase(thread_context_t* ctx);
 
 // Workload execution
 void* workload_thread(void* arg);

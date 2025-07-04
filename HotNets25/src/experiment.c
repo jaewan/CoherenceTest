@@ -19,9 +19,9 @@ typedef struct {
 
 // Results structure
 typedef struct {
-    double phase1_avg_ns;
-    double phase2_avg_ns;
-    double phase3_avg_ns;
+    double map_phase_avg_ns;
+    double shuffle_phase_avg_ns;
+    double reduce_phase_avg_ns;
     double total_avg_ns;
     const char* system_name;
 } experiment_results_t;
@@ -70,146 +70,130 @@ static const char* get_system_name(system_type_t system_type) {
 static experiment_results_t run_experiment(experiment_config_t* config) {
     experiment_results_t results = {0};
     results.system_name = get_system_name(config->system_type);
-    
+
     // Detect topology
     detect_numa_topology();
-    if (config->verbose) {
-        print_numa_topology();
-    }
-    
     int total_sockets = get_total_sockets();
-    int cores_per_socket = get_cores_per_socket();
+    if (total_sockets < 2) {
+        printf("\nWARNING: This experiment is designed for multi-socket systems, but only %d socket was detected.\n", total_sockets);
+        printf("The results will not demonstrate inter-socket coherence effects.\n");
+    }
     int total_threads = total_sockets * config->num_threads_per_socket;
-    
+
     if (config->verbose) {
-        printf("\nRunning experiment: %s\n", results.system_name);
-        printf("Threads per socket: %d\n", config->num_threads_per_socket);
-        printf("Total threads: %d\n", total_threads);
-        printf("Increments per thread: %d\n", config->increments_per_thread);
-        printf("Compute cycles: %d\n", config->compute_cycles);
+        printf("\n--- Running Experiment: %s ---\n", results.system_name);
+        printf("Configuration: %d threads (%d per socket across %d sockets)\n", 
+               total_threads, config->num_threads_per_socket, total_sockets);
     }
-    
-    // Calibrate coherence tax for fully coherent system
-    if (config->system_type == SYSTEM_FULLY_COHERENT) {
-        calibrate_coherence_tax();
-    }
-    
-    // Setup workload configuration
-    workload_config_t workload_config = {
+
+    // Allocate resources
+    pthread_t* threads = malloc(total_threads * sizeof(pthread_t));
+    thread_context_t* contexts = malloc(total_threads * sizeof(thread_context_t));
+    shared_data_t* shared_data = malloc(total_sockets * sizeof(shared_data_t));
+    generic_lock_t* intra_locks = malloc(total_sockets * sizeof(generic_lock_t));
+    generic_lock_t* inter_locks = malloc(total_sockets * sizeof(generic_lock_t));
+    void** intra_lock_data = malloc(total_sockets * sizeof(void*));
+    void** inter_lock_data = malloc(total_sockets * sizeof(void*));
+    pthread_barrier_t start_barrier;
+
+    pthread_barrier_init(&start_barrier, NULL, total_threads + 1);
+
+    // Create a workload_config_t from the experiment_config_t to pass to the workload module.
+    workload_config_t workload_conf = {
         .num_threads_per_socket = config->num_threads_per_socket,
         .increments_per_thread = config->increments_per_thread,
         .compute_cycles = config->compute_cycles,
+        .system_type = config->system_type,
         .total_sockets = total_sockets
     };
-    
-    // Setup locks for each socket
-    generic_lock_t* intra_locks = malloc(total_sockets * sizeof(generic_lock_t));
-    generic_lock_t* inter_locks = malloc(total_sockets * sizeof(generic_lock_t));
-    void** intra_data = malloc(total_sockets * sizeof(void*));
-    void** inter_data = malloc(total_sockets * sizeof(void*));
-    
-    for (int socket = 0; socket < total_sockets; socket++) {
-        setup_system_locks(config->system_type, socket, 
-                          &intra_locks[socket], &inter_locks[socket],
-                          &intra_data[socket], &inter_data[socket]);
+
+    // Setup locks for each socket based on the system type
+    for (int i = 0; i < total_sockets; i++) {
+        setup_system_locks(config->system_type, i, &intra_locks[i], &inter_locks[i], &intra_lock_data[i], &inter_lock_data[i]);
     }
-    
-    // Setup shared data
-    shared_data_t shared;
-    init_shared_data(&shared, &workload_config, &intra_locks[0], &inter_locks[0]);
-    
-    // Setup thread contexts
-    thread_context_t* contexts = malloc(total_threads * sizeof(thread_context_t));
-    pthread_t* threads = malloc(total_threads * sizeof(pthread_t));
-    
-    int thread_id = 0;
-    for (int socket = 0; socket < total_sockets; socket++) {
-        for (int local_thread = 0; local_thread < config->num_threads_per_socket; local_thread++) {
-            contexts[thread_id].thread_id = thread_id;
-            contexts[thread_id].socket_id = socket;
-            contexts[thread_id].core_id = socket * cores_per_socket + local_thread;
-            contexts[thread_id].config = &workload_config;
-            contexts[thread_id].shared = &shared;
-            
-            // Use socket-specific locks
-            contexts[thread_id].shared->intra_node_lock = &intra_locks[socket];
-            contexts[thread_id].shared->inter_node_lock = &inter_locks[socket];
-            
-            thread_id++;
-        }
-    }
-    
-    // Launch threads
+    init_shared_data(shared_data, &workload_conf, intra_locks, inter_locks);
+
+    // Create and configure threads
     for (int i = 0; i < total_threads; i++) {
+        int socket_id = i / config->num_threads_per_socket;
+        contexts[i] = (thread_context_t){
+            .thread_id = i,
+            .socket_id = socket_id,
+            .core_id = i, // Simple mapping: thread i -> core i
+            .config = &workload_conf, // Pass pointer to workload-specific config
+            .shared = shared_data,
+            .start_barrier = &start_barrier
+        };
+        pin_thread_to_core(i);
         pthread_create(&threads[i], NULL, workload_thread, &contexts[i]);
     }
-    
-    // Wait for completion
+
+    // Start all threads simultaneously
+    pthread_barrier_wait(&start_barrier);
+
+    // Wait for all threads to complete
     for (int i = 0; i < total_threads; i++) {
         pthread_join(threads[i], NULL);
     }
-    
-    // Calculate average timings
-    double phase1_total = 0, phase2_total = 0, phase3_total = 0, total_total = 0;
+
+    // Aggregate results
+    double total_map = 0, total_shuffle = 0, total_reduce = 0, total_overall = 0;
     for (int i = 0; i < total_threads; i++) {
-        phase1_total += timer_get_elapsed_ns(&contexts[i].phase_timers[0]);
-        phase2_total += timer_get_elapsed_ns(&contexts[i].phase_timers[1]);
-        phase3_total += timer_get_elapsed_ns(&contexts[i].phase_timers[2]);
-        total_total += timer_get_elapsed_ns(&contexts[i].total_timer);
+        total_map += timer_get_elapsed_ns(&contexts[i].phase_timers[2]);
+        total_shuffle += timer_get_elapsed_ns(&contexts[i].phase_timers[1]);
+        total_reduce += timer_get_elapsed_ns(&contexts[i].phase_timers[0]);
+        total_overall += timer_get_elapsed_ns(&contexts[i].total_timer);
     }
-    
-    results.phase1_avg_ns = phase1_total / total_threads;
-    results.phase2_avg_ns = phase2_total / total_threads;
-    results.phase3_avg_ns = phase3_total / total_threads;
-    results.total_avg_ns = total_total / total_threads;
-    
+
+    results.map_phase_avg_ns = total_map / total_threads;
+    results.shuffle_phase_avg_ns = total_shuffle / total_threads;
+    results.reduce_phase_avg_ns = total_reduce / total_threads;
+    results.total_avg_ns = total_overall / total_threads;
+
     // Cleanup
-    for (int socket = 0; socket < total_sockets; socket++) {
-        free(intra_data[socket]);
-        free(inter_data[socket]);
+    for (int i = 0; i < total_sockets; i++) {
+        free(intra_lock_data[i]);
+        free(inter_lock_data[i]);
     }
+    free(threads);
+    free(contexts);
+    free(shared_data);
     free(intra_locks);
     free(inter_locks);
-    free(intra_data);
-    free(inter_data);
-    free(contexts);
-    free(threads);
-    
+    free(intra_lock_data);
+    free(inter_lock_data);
+    pthread_barrier_destroy(&start_barrier);
+
     return results;
 }
 
 // Print results
 static void print_results(experiment_results_t* results, int num_systems) {
-    printf("\n=== EXPERIMENT RESULTS ===\n");
-    printf("%-20s | %12s | %12s | %12s | %12s\n", 
-           "System", "Phase 1 (ms)", "Phase 2 (ms)", "Phase 3 (ms)", "Total (ms)");
-    printf("%-20s-+-%12s-+-%12s-+-%12s-+-%12s\n", 
-           "--------------------", "------------", "------------", "------------", "------------");
-    
+    printf("\n--- Experiment Results ---\n");
+    printf("%-25s %15s %15s %15s %15s\n", "System", "Map (ms)", "Shuffle (ms)", "Reduce (ms)", "Total (ms)");
+    printf("%-25s %15s %15s %15s %15s\n", "-------------------------", "---------------", "---------------", "---------------", "---------------");
+
     for (int i = 0; i < num_systems; i++) {
-        printf("%-20s | %12.3f | %12.3f | %12.3f | %12.3f\n",
-               results[i].system_name,
-               results[i].phase1_avg_ns / 1e6,
-               results[i].phase2_avg_ns / 1e6,
-               results[i].phase3_avg_ns / 1e6,
+        printf("%-25s %15.3f %15.3f %15.3f %15.3f\n", 
+               results[i].system_name, 
+               results[i].map_phase_avg_ns / 1e6, 
+               results[i].shuffle_phase_avg_ns / 1e6, 
+               results[i].reduce_phase_avg_ns / 1e6, 
                results[i].total_avg_ns / 1e6);
     }
-    
-    printf("\nPhase 1: Intra-Node Parallel Work (Local Reduce)\n");
-    printf("Phase 2: Inter-Node Coordination (Global Barrier)\n");
-    printf("Phase 3: Scalable Parallel Compute\n");
 }
 
 // Usage function
 static void print_usage(const char* prog_name) {
     printf("Usage: %s [options]\n", prog_name);
     printf("Options:\n");
-    printf("  -s <system>    System type: coherent, federated, non-coherent, all (default: all)\n");
-    printf("  -t <threads>   Threads per socket (default: 4)\n");
+    printf("  -s <system>     System type: coherent, federated, non-coherent, all (default: all)\n");
+    printf("  -t <threads>    Threads per socket (default: 4)\n");
     printf("  -i <increments> Increments per thread (default: 1000)\n");
-    printf("  -c <cycles>    Compute cycles (default: 100000)\n");
-    printf("  -v             Verbose output\n");
-    printf("  -h             Show this help\n");
+    printf("  -c <cycles>     Compute cycles (default: 100000)\n");
+    printf("  -n <trials>     Number of trials to run and average (default: 5)\n");
+    printf("  -v              Verbose output\n");
+    printf("  -h              Show this help\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -222,10 +206,11 @@ int main(int argc, char* argv[]) {
     };
     
     bool run_all = true;
+    int num_trials = 5; // Default number of trials
     
     // Parse command line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "s:t:i:c:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "s:t:i:c:n:vh")) != -1) {
         switch (opt) {
             case 's':
                 run_all = false;
@@ -252,6 +237,9 @@ int main(int argc, char* argv[]) {
             case 'c':
                 config.compute_cycles = atoi(optarg);
                 break;
+            case 'n':
+                num_trials = atoi(optarg);
+                break;
             case 'v':
                 config.verbose = true;
                 break;
@@ -265,20 +253,51 @@ int main(int argc, char* argv[]) {
     }
     
     printf("=== FEDERATED COHERENCE EXPERIMENT ===\n");
+    printf("Running %d trial(s) for each system...\n", num_trials);
     
     if (run_all) {
-        experiment_results_t results[3];
+        experiment_results_t final_results[3];
         system_type_t systems[] = {SYSTEM_FULLY_COHERENT, SYSTEM_FEDERATED_COHERENCE, SYSTEM_FULLY_NON_COHERENT};
         
         for (int i = 0; i < 3; i++) {
-            config.system_type = systems[i];
-            results[i] = run_experiment(&config);
+            // Initialize aggregated results for this system
+            final_results[i] = (experiment_results_t){ .system_name = get_system_name(systems[i]) };
+
+            for (int trial = 0; trial < num_trials; trial++) {
+                config.system_type = systems[i];
+                experiment_results_t trial_result = run_experiment(&config);
+                final_results[i].map_phase_avg_ns += trial_result.map_phase_avg_ns;
+                final_results[i].shuffle_phase_avg_ns += trial_result.shuffle_phase_avg_ns;
+                final_results[i].reduce_phase_avg_ns += trial_result.reduce_phase_avg_ns;
+                final_results[i].total_avg_ns += trial_result.total_avg_ns;
+            }
+
+            // Average the results
+            final_results[i].map_phase_avg_ns /= num_trials;
+            final_results[i].shuffle_phase_avg_ns /= num_trials;
+            final_results[i].reduce_phase_avg_ns /= num_trials;
+            final_results[i].total_avg_ns /= num_trials;
         }
         
-        print_results(results, 3);
+        print_results(final_results, 3);
     } else {
-        experiment_results_t result = run_experiment(&config);
-        print_results(&result, 1);
+        experiment_results_t final_result = { .system_name = get_system_name(config.system_type) };
+
+        for (int trial = 0; trial < num_trials; trial++) {
+            experiment_results_t trial_result = run_experiment(&config);
+            final_result.map_phase_avg_ns += trial_result.map_phase_avg_ns;
+            final_result.shuffle_phase_avg_ns += trial_result.shuffle_phase_avg_ns;
+            final_result.reduce_phase_avg_ns += trial_result.reduce_phase_avg_ns;
+            final_result.total_avg_ns += trial_result.total_avg_ns;
+        }
+
+        // Average the results
+        final_result.map_phase_avg_ns /= num_trials;
+        final_result.shuffle_phase_avg_ns /= num_trials;
+        final_result.reduce_phase_avg_ns /= num_trials;
+        final_result.total_avg_ns /= num_trials;
+
+        print_results(&final_result, 1);
     }
     
     return 0;

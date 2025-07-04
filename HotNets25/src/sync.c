@@ -58,19 +58,19 @@ void bakery_lock_release(bakery_lock_t* lock, int thread_id) {
 }
 
 // Generic lock interface wrappers
-static void hw_lock_acquire_wrapper(void* lock, int thread_id) {
+static void hw_lock_acquire_wrapper(volatile void* lock, int thread_id) {
     hw_lock_acquire((hw_lock_t*)lock);
 }
 
-static void hw_lock_release_wrapper(void* lock, int thread_id) {
+static void hw_lock_release_wrapper(volatile void* lock, int thread_id) {
     hw_lock_release((hw_lock_t*)lock);
 }
 
-static void bakery_lock_acquire_wrapper(void* lock, int thread_id) {
+static void bakery_lock_acquire_wrapper(volatile void* lock, int thread_id) {
     bakery_lock_acquire((bakery_lock_t*)lock, thread_id);
 }
 
-static void bakery_lock_release_wrapper(void* lock, int thread_id) {
+static void bakery_lock_release_wrapper(volatile void* lock, int thread_id) {
     bakery_lock_release((bakery_lock_t*)lock, thread_id);
 }
 
